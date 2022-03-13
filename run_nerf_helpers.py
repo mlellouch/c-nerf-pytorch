@@ -81,7 +81,7 @@ class NeRF(nn.Module):
             [nn.Linear(input_ch + input_ch_views, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch + input_ch_views, W) for i in range(D-1)])
 
         final_in_size = W + input_ch + input_ch_views if D-1 in self.skips else W
-        self.output_linear = nn.Linear(final_in_size, 4 * (self.degree + 1))
+        self.output_linear = nn.Linear(final_in_size, output_ch)
 
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)

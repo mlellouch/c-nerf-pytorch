@@ -175,9 +175,17 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     return rgbs, disps
 
 
+CHANNELS_GLOBAL = {
+    'color_poly': False,
+    'rgb': 0,
+    'alpha': 0,
+    'importance': 0
+}
+
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    global CHANNELS_GLOBAL
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
@@ -186,21 +194,36 @@ def create_nerf(args):
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
 
+    # new calculation
+    output_ch = args.polynomial_degree + 1 # for the density
+    CHANNELS_GLOBAL['alpha'] = args.polynomial_degree + 1
+    if args.colors_in_polynomial:
+        CHANNELS_GLOBAL['color_poly'] = True
+        CHANNELS_GLOBAL['rgb'] = 3 * (args.polynomial_degree + 1)
+        output_ch += 3 * (args.polynomial_degree + 1) # for the colors
+    else:
+        CHANNELS_GLOBAL['rgb'] = 3
+        output_ch += 3
+
+    coarse_output_ch = output_ch + (1 if args.N_importance > 0 else 0)
+    CHANNELS_GLOBAL['importance'] = (1 if args.N_importance > 0 else 0)
+
 
     skips = [4]
     if args.skip_all:
         skips = list(range(args.netdepth))
     model = NeRF(D=args.netdepth, W=args.netwidth,
-                 input_ch=input_ch, output_ch=output_ch, skips=skips,
+                 input_ch=input_ch, output_ch=coarse_output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
                  polynomilal_degree=args.polynomial_degree).to(device)
     grad_vars = list(model.parameters())
 
     model_fine = None
     if args.N_importance > 0:
-        model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
-                          input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+        model_fine = NeRF(D=args.netdepth, W=args.netwidth,
+                     input_ch=input_ch, output_ch=output_ch, skips=skips,
+                     input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                     polynomilal_degree=args.polynomial_degree).to(device)
         grad_vars += list(model_fine.parameters())
 
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
@@ -278,51 +301,60 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    if not use_polys:
-        raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-    else:
-        def raw2alpha(raw, dists, act_fn=F.relu):
-            # raw = [num_rays, num_samples, degree+1]
-            # We wish to compare the integrals at t=0 and t=dist
-            # but for every polynomial at t=0 is 0, so just for t=dist
-
-            # step 1: calculate the x + x^2 + ... polynomial
-            poly = torch.arange(1.0, degree+2, device=device)
-            duplicated_dists = dists.unsqueeze(2).repeat(1, 1, degree + 1)
-            power_dists = duplicated_dists.pow(poly)
-
-            # step 2: multiply by 1, 1/2, 1/3 ..., and by raw
-            power_dists /= poly
-            power_dists *= raw
-
-            # step 3: sum
-            power_dists = power_dists.sum(dim=2)
-
-            return 1.-torch.exp(-act_fn(power_dists))
+    global CHANNELS_GLOBAL
 
 
+    def raw2alpha(raw, dists, act_fn=F.relu):
+        # raw = [num_rays, num_samples, degree+1]
+        # We wish to compare the integrals at t=0 and t=dist
+        # but for every polynomial at t=0 is 0, so just for t=dist
 
+        # step 1: calculate the x + x^2 + ... polynomial
+        poly = torch.arange(1.0, degree+2, device=device)
+        duplicated_dists = dists.unsqueeze(2).repeat(1, 1, degree + 1)
+        power_dists = duplicated_dists.pow(poly)
+
+        # step 2: multiply by 1, 1/2, 1/3 ..., and by raw
+        power_dists /= poly
+        power_dists *= raw
+
+        # step 3: sum
+        power_dists = power_dists.sum(dim=2)
+
+        return 1.-torch.exp(-act_fn(power_dists))
 
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
-    rgb_alpha_split = 3 * (degree + 1)
+    rgb_alpha_split = CHANNELS_GLOBAL['rgb']
+    alpha_importance_split = CHANNELS_GLOBAL['rgb'] + CHANNELS_GLOBAL['alpha']
     rgb = torch.sigmoid(raw[...,:rgb_alpha_split])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,rgb_alpha_split:].shape) * raw_noise_std
+        noise = torch.randn(raw[...,rgb_alpha_split:alpha_importance_split].shape) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,rgb_alpha_split:].shape)) * raw_noise_std
+            noise = np.random.rand(*list(raw[...,rgb_alpha_split:alpha_importance_split].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[...,rgb_alpha_split:] + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[...,rgb_alpha_split:alpha_importance_split] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+
+    # normally, at this point rgb is [num_ray, num_samples, 3]. But if it is polynomial, we need to
+    # integrate it as well
+    if CHANNELS_GLOBAL['color_poly']:
+        r = rgb[..., :degree+1]
+        g = rgb[..., degree + 1: 2*degree + 2]
+        b = rgb[..., 2*degree + 2:]
+        rgb = [raw2alpha(color, dists)[..., None] for color in [r,g,b]]
+        rgb = torch.cat(rgb, dim=2)
+
+
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
     depth_map = torch.sum(weights * z_vals, -1)
