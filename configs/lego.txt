@@ -17,3 +17,7 @@ precrop_iters = 500
 precrop_frac = 0.5
 
 half_res = True
+
+skip_all = True
+polynomial_degree = 2
+colors_in_polynomial = True

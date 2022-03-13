@@ -185,10 +185,15 @@ def create_nerf(args):
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
+
+
     skips = [4]
+    if args.skip_all:
+        skips = list(range(args.netdepth))
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                 polynomilal_degree=args.polynomial_degree).to(device)
     grad_vars = list(model.parameters())
 
     model_fine = None
@@ -259,12 +264,13 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, use_polys=False, degree=2):
     """Transforms model's predictions to semantically meaningful values.
     Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        raw: [num_rays, num_samples along ray, 4 * (degree+1)]. Prediction from model.
         z_vals: [num_rays, num_samples along ray]. Integration time.
         rays_d: [num_rays, 3]. Direction of each ray.
+        use_polys: if false, outputs are calculated like in NeRF.
     Returns:
         rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
         disp_map: [num_rays]. Disparity map. Inverse of depth map.
@@ -272,25 +278,49 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    if not use_polys:
+        raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    else:
+        def raw2alpha(raw, dists, act_fn=F.relu):
+            # raw = [num_rays, num_samples, degree+1]
+            # We wish to compare the integrals at t=0 and t=dist
+            # but for every polynomial at t=0 is 0, so just for t=dist
+
+            # step 1: calculate the x + x^2 + ... polynomial
+            poly = torch.arange(1.0, degree+2, device=device)
+            duplicated_dists = dists.unsqueeze(2).repeat(1, 1, degree + 1)
+            power_dists = duplicated_dists.pow(poly)
+
+            # step 2: multiply by 1, 1/2, 1/3 ..., and by raw
+            power_dists /= poly
+            power_dists *= raw
+
+            # step 3: sum
+            power_dists = power_dists.sum(dim=2)
+
+            return 1.-torch.exp(-act_fn(power_dists))
+
+
+
 
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
-    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+    rgb_alpha_split = 3 * (degree + 1)
+    rgb = torch.sigmoid(raw[...,:rgb_alpha_split])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+        noise = torch.randn(raw[...,rgb_alpha_split:].shape) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
+            noise = np.random.rand(*list(raw[...,rgb_alpha_split:].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[...,rgb_alpha_split:] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
@@ -383,7 +413,7 @@ def render_rays(ray_batch,
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, use_polys=True)
 
     if N_importance > 0:
 
@@ -456,6 +486,16 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
+
+    parser.add_argument("--skip_all", action='store_true',
+                        help='Make every layer receive the input. ')
+    parser.add_argument("--polynomial_degree", type=int, default=2,
+                        help='The degree of the outputted polynomial')
+    parser.add_argument('--no_poly_oter', type=int, default=10000,
+                        help='Number of iterations where polynomials are not used to render,'
+                             'but they are trained')
+    parser.add_argument("--colors_in_polynomial", action='store_true',
+                        help='Should the colors be expressed in polynomials')
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
@@ -530,11 +570,18 @@ def config_parser():
 
     return parser
 
+from knockknock import telegram_sender
 
+CHAT_ID = 1281429340
+API_TOKEN = '5134784650:AAFm18n8hZVk9dRJUtoOMAa18nLWshnz4hw'
+
+
+# @telegram_sender(token=API_TOKEN, chat_id=CHAT_ID)
 def train():
 
     parser = config_parser()
     args = parser.parse_args()
+    assert args.use_viewdirs
 
     # Load data
     K = None
